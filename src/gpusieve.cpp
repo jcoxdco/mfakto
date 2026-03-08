@@ -655,6 +655,20 @@ void gpusieve_init_class (mystuff_t *mystuff, unsigned long long k_min)
 }
 
 
+// [Technical] Advances bit-to-clear values by gpu_sieve_size for the next sieve batch
+// within the same class, avoiding the full CalcBitToClear recomputation.
+// [Performance] Uses the lightweight AdvanceBitToClear kernel (32-bit mod per prime)
+// instead of CalcBitToClear (64-bit mod per prime).
+void gpusieve_advance_class (mystuff_t *mystuff)
+{
+#ifdef RAW_GPU_BENCH
+  return;
+#endif
+
+  run_advance_bit_to_clear(primes_per_thread+1, threadsPerBlock, NULL, mystuff->gpu_sieve_size);
+}
+
+
 // GPU sieve the next chunk
 
 void gpusieve (mystuff_t *mystuff, unsigned long long num_k_remaining)

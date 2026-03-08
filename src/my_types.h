@@ -145,6 +145,7 @@ enum GPUKernels
   CL_CALC_BIT_TO_CLEAR,  // loaded if GPU sieving enabled
   CL_CALC_MOD_INV,       // loaded if GPU sieving enabled
   CL_SIEVE,              // loaded if GPU sieving enabled
+  CL_ADVANCE_BIT_TO_CLEAR, // loaded if GPU sieving enabled; advances bit-to-clear between sieve batches
   BARRETT79_MUL32_GS,
   BARRETT77_MUL32_GS,
   BARRETT76_MUL32_GS,

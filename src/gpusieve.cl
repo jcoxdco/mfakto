@@ -1454,6 +1454,51 @@ if (factor_mod_p != 0)
 }	
 
 
+// [Technical] Advances existing bit-to-clear values by gpu_sieve_size positions for the
+// next sieve batch within the same class. Each thread reads its current bit-to-clear from
+// pinfo_dev, adds (gpu_sieve_size % prime), and reduces mod prime. This avoids the full
+// 64-bit modular arithmetic of CalcBitToClear (k_base % prime, factor_mod_p, etc.).
+// [Performance] Replaces the per-batch CalcBitToClear call with a single 32-bit modulo
+// per prime. For typical gpu_sieve_size values, (gpu_sieve_size % prime) fits in 32 bits,
+// making the advance much cheaper than recomputing from scratch.
+__kernel void __attribute__((reqd_work_group_size(256, 1, 1))) AdvanceBitToClear (uint gpu_sieve_size, __global int *calc_info, __global uchar *pinfo_dev)
+{
+	uint	index;
+	uint	mask;
+	uint	prime;
+	uint	bit_to_clear;
+	uint	advance;
+
+	if (get_group_id(0) == 0) {
+		if (get_local_id(0) < primesNotSieved || get_local_id(0) >= primesNotSieved + primesHandledWithSpecialCode) return;
+		pinfo_dev += get_local_id(0) * 2;
+		index = get_local_id(0);
+	}
+
+	else {
+		pinfo_dev += calc_info[(get_group_id(0) - 1)];
+		pinfo_dev += get_local_id(0) * 4;
+		index = calc_info[MAX_PRIMES_PER_THREAD + (get_group_id(0) - 1)];
+		index += get_local_id(0) * calc_info[MAX_PRIMES_PER_THREAD*2 + (get_group_id(0) - 1)];
+		mask = calc_info[MAX_PRIMES_PER_THREAD*3 + (get_group_id(0) - 1)];
+	}
+
+	prime = calc_info[MAX_PRIMES_PER_THREAD*4 + index * 2];
+	advance = gpu_sieve_size % prime;
+
+	if (get_group_id(0) == 0) {
+		bit_to_clear = *pinfo16;
+		bit_to_clear = (bit_to_clear + prime - advance) % prime;
+		*pinfo16 = bit_to_clear;
+	}
+	else {
+		bit_to_clear = *pinfo32 & ~mask;
+		bit_to_clear = (bit_to_clear + prime - advance) % prime;
+		*pinfo32 = (*pinfo32 & mask) + bit_to_clear;
+	}
+}
+
+
 /* This function is used at the beginning of each GPU-sieve TF-kernel in order to extract the bits from the sieve.
    returns total number of bits set */
 

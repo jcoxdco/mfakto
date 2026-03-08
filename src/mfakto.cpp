@@ -97,6 +97,7 @@ kernel_info_t       kernel_info[] = {
      {   CL_CALC_BIT_TO_CLEAR, "CalcBitToClear",       0,      0,         0,      NULL}, // called by gpusieve_init_class
      {   CL_CALC_MOD_INV,     "CalcModularInverses",   0,      0,         0,      NULL}, // called by gpusieve_init_exponent
      {   CL_SIEVE,            "SegSieve",              0,      0,         0,      NULL}, // GPU sieve
+     {   CL_ADVANCE_BIT_TO_CLEAR, "AdvanceBitToClear", 0,      0,         0,      NULL}, // advance bit-to-clear between sieve batches
      {   BARRETT79_MUL32_GS,  "cl_barrett32_79_gs",   64,     79,         1,      NULL}, // keep the GPU-sieve-based kernels in the same order as their CPU-sieve versions
      {   BARRETT77_MUL32_GS,  "cl_barrett32_77_gs",   64,     77,         1,      NULL},
      {   BARRETT76_MUL32_GS,  "cl_barrett32_76_gs",   64,     76,         1,      NULL},
@@ -246,6 +247,28 @@ int init_CLstreams(int gs_reinit_only)
       return 1;
     }
     // param 2 (primes_per_thread) is variable, can't set it now.
+
+    // [Technical] AdvanceBitToClear shares the same calc_info and sieve_info buffers as
+    // CalcBitToClear but only needs gpu_sieve_size (arg 0) set per call.
+    // [Performance] Pre-binding args 1 and 2 avoids repeated clSetKernelArg overhead.
+    status = clSetKernelArg(kernel_info[CL_ADVANCE_BIT_TO_CLEAR].kernel,
+                      1,
+                      sizeof(cl_mem),
+                      (void *)&mystuff.d_calc_bit_to_clear_info);
+    if(status != CL_SUCCESS)
+    {
+      std::cout<<"Error " << status << " (" << ClErrorString(status) << "): Setting kernel argument. (d_calc_bit_to_clear_info for AdvanceBitToClear)\n";
+      return 1;
+    }
+    status = clSetKernelArg(kernel_info[CL_ADVANCE_BIT_TO_CLEAR].kernel,
+                      2,
+                      sizeof(cl_mem),
+                      (void *)&mystuff.d_sieve_info);
+    if(status != CL_SUCCESS)
+    {
+      std::cout<<"Error " << status << " (" << ClErrorString(status) << "): Setting kernel argument. (d_sieve_info for AdvanceBitToClear)\n";
+      return 1;
+    }
   }
 
   return 0;
@@ -1651,6 +1674,85 @@ cl_int run_calc_bit_to_clear(cl_uint numblocks, size_t localThreads, cl_event *r
   return 0;
 }
 
+// [Technical] Advances existing bit-to-clear values by gpu_sieve_size positions for the
+// next sieve batch within the same class, using modular arithmetic instead of the full
+// 64-bit CalcBitToClear computation. Kernel args 1 (calc_info) and 2 (sieve_info) are
+// pre-bound in init_CLstreams(); only arg 0 (gpu_sieve_size) is set per invocation.
+// [Performance] Replaces the redundant gpusieve_init_class() call that re-ran
+// CalcBitToClear with expensive 64-bit mod per prime. AdvanceBitToClear only needs
+// a single 32-bit modulo per prime to shift values forward by gpu_sieve_size.
+cl_int run_advance_bit_to_clear(cl_uint numblocks, size_t localThreads, cl_event *run_event, cl_uint gpu_sieve_size)
+{
+  cl_int   status;
+  size_t   globalThreads = numblocks * localThreads;
+
+#ifdef DETAILED_INFO
+    printf("run_advance_bit_to_clear: %d x %d = %d threads, gpu_sieve_size=%u\n",
+        (int) numblocks, (int) localThreads, (int) globalThreads, gpu_sieve_size);
+#endif
+
+  status = clSetKernelArg(kernel_info[CL_ADVANCE_BIT_TO_CLEAR].kernel,
+                    0,
+                    sizeof(cl_uint),
+                    (void *)&gpu_sieve_size);
+  if(status != CL_SUCCESS)
+  {
+    std::cout<<"Error " << status << " (" << ClErrorString(status) << "): Setting kernel argument. (gpu_sieve_size)\n";
+    return 1;
+  }
+
+#ifdef CL_PERFORMANCE_INFO
+  if (run_event == NULL) run_event = &mystuff.copy_events[0];
+#endif
+
+  status = clEnqueueNDRangeKernel(QUEUE,
+                 kernel_info[CL_ADVANCE_BIT_TO_CLEAR].kernel,
+                 1,
+                 NULL,
+                 &globalThreads,
+                 &localThreads,
+                 0,
+                 NULL,
+                 run_event);
+  if(status != CL_SUCCESS)
+  {
+    std::cerr<< "Error " << status << " (" << ClErrorString(status) << "): Enqueuing kernel (clEnqueueNDRangeKernel) " << kernel_info[CL_ADVANCE_BIT_TO_CLEAR].kernelname << "\n";
+    return 1;
+  }
+
+#ifdef CL_PERFORMANCE_INFO
+  clFinish(QUEUE);
+  cl_ulong startTime=0;
+  cl_ulong endTime=1000;
+  status = clGetEventProfilingInfo(*run_event,
+                                CL_PROFILING_COMMAND_START,
+                                sizeof(cl_ulong),
+                                &startTime,
+                                0);
+  if(status != CL_SUCCESS)
+  {
+    std::cerr<< "Error " << status << " (" << ClErrorString(status) << "): in clGetEventProfilingInfo.(startTime)\n";
+    return RET_ERROR;
+  }
+  status = clGetEventProfilingInfo(*run_event,
+                                CL_PROFILING_COMMAND_END,
+                                sizeof(cl_ulong),
+                                &endTime,
+                                0);
+  if(status != CL_SUCCESS)
+  {
+    std::cerr<< "Error " << status << " (" << ClErrorString(status) << "): in clGetEventProfilingInfo.(endTime)\n";
+    return RET_ERROR;
+  }
+  std::cout<< "AdvanceBitToClear " << globalThreads << " primes: " << (endTime - startTime)/1e3 << " us ("
+                       << globalThreads * 1e3 / (endTime - startTime) << " M/s)\n" ;
+  clReleaseEvent(mystuff.copy_events[0]);
+#endif
+
+  return 0;
+}
+
+
 /* Run the SegSieve kernel
 __kernel void __attribute__((reqd_work_group_size(256, 1, 1))) SegSieve (__global uchar *big_bit_array_dev, __global uchar *pinfo_dev, uint maxp)
 
@@ -2924,10 +3026,12 @@ int tf_class_opencl(cl_ulong k_min, cl_ulong k_max, mystuff_t *mystuff, enum GPU
         k_min += (cl_ulong) mystuff->gpu_sieve_size * mystuff->num_classes;
         if (k_min > k_max) break;
 
-        //BUG - we should call a different routine to advance the bit-to-clear values by gpusieve_size bits
-        // This will be cheaper than recomputing the bit-to-clears from scratch
-        // HOWEVER, the self-test code will not check this new code unless we make the gpusieve_size much smaller
-        gpusieve_init_class (mystuff, k_min);
+        // [Technical] Advance bit-to-clear values incrementally instead of recomputing
+        // from scratch. The original gpusieve_init_class() launched the full CalcBitToClear
+        // kernel with expensive 64-bit modular arithmetic for every prime.
+        // [Performance] gpusieve_advance_class() uses AdvanceBitToClear which only needs
+        // a single 32-bit modulo per prime to shift values forward by gpu_sieve_size.
+        gpusieve_advance_class (mystuff);
         continue; // don't go to the stream-scheduling code below - the GPU sieve runs the TF kernels all in one stream
       }
       mystuff->stream_status[h_ktab_index] = PREPARED;
