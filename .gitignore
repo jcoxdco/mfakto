@@ -46,3 +46,5 @@ worktodo.add
 # other
 .DS_Store
 *.zip
+/.cursor/rules
+/mfaktoVS12.vcxproj
